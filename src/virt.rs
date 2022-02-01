@@ -2,7 +2,7 @@ use rand::{thread_rng, Rng, prelude::ThreadRng};
 
 //http://devernay.free.fr/hacks/chip8/C8TECH10.HTM
 
-struct Config {
+pub struct Config {
 	// 150->(300)->500 hz is recommended
 	clock_hz: u32, // the upperbound for how many instrs are done a second
 	screen_magnifier: u32, // x1, x2, x4, etc.
@@ -17,7 +17,7 @@ A 0 B F
 some instrs can halt on keyboard input, or just get the state of the keyboard.
 */
 
-struct Chip8 {
+pub struct Chip8 {
 	pc: usize,
 	buf: [u8; 4096],
 	registers: [u8; 16],
@@ -30,7 +30,7 @@ struct Chip8 {
 }
 
 impl Chip8 {
-	fn new() -> Chip8 {
+	pub fn new() -> Chip8 {
 		let mut buf = [0; 4096];
 		let sprites = [
 			0xF0, 0x90, 0x90, 0x90, 0xF0, // 0x0
@@ -68,7 +68,7 @@ impl Chip8 {
 		}
 	}
 
-	fn clock(&mut self) -> Result<(), &str> {
+	pub fn clock(&mut self) -> Result<(), &str> {
 		let instr: u16 = 
 			(self.buf[self.pc] as u16) << 8 | 
 			 self.buf[self.pc + 1] as u16;
@@ -89,7 +89,7 @@ impl Chip8 {
 					Some(addr) => {
 						self.pc = addr as usize;
 					},
-					None => return Err("Attempted to exit from a subroutine when there was nothing to return to."),
+					None => return Err("attempted to exit from a subroutine when there was nothing to return to."),
 				}
 			},
 			_ => {},
