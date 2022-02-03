@@ -1,4 +1,5 @@
 use rand::{thread_rng, Rng, prelude::ThreadRng};
+use sdl2::{EventPump, keyboard::Scancode};
 
 //http://devernay.free.fr/hacks/chip8/C8TECH10.HTM
 
@@ -25,8 +26,24 @@ pub struct Chip8 {
 	addr_stack: Vec<u16>, // no additional alloc is done if you specify .with_capacity()
 	delay_timer: u8,
 	sound_timer: u8,
-	display: [u64; 32],
+	pub display: [u64; 32],
 	rand_thread: ThreadRng,
+}
+/// Checks corresponding scancodes
+fn is_hex_key_pressed(event_pump: &mut EventPump, hex: u8) -> bool {
+	if hex > 0xF {
+		return false;
+	}
+
+	let codes = [
+		Scancode::Num1, Scancode::Num2, Scancode::Num3, Scancode::Num4, 
+		Scancode::Q,    Scancode::W,    Scancode::E,    Scancode::R,
+		Scancode::A,    Scancode::S,    Scancode::D,    Scancode::F,
+		Scancode::Z,    Scancode::X,    Scancode::C,    Scancode::V,
+	];
+
+	let code: Scancode = codes[hex as usize];
+	event_pump.keyboard_state().is_scancode_pressed(code)
 }
 
 impl Chip8 {
@@ -68,7 +85,31 @@ impl Chip8 {
 		}
 	}
 
-	pub fn clock(&mut self) -> Result<(), &str> {
+	/// Display n-byte sprite starting at memory location I at (Vx, Vy), set VF = collision.
+	/// If the sprite is positioned so part of it is outside the coordinates of the display, 
+	/// it wraps around to the opposite side of the screen
+	fn xor_sprite(&mut self, x: u8, y: u8, n: u8) {
+		for i in 0..n {
+			let sprite_row = (self.buf[self.addr_register as usize + i as usize] as u64) << (64 - 8);
+			let rotated_row = sprite_row.rotate_right(x.into());
+			let r = ((y + i) % 32) as usize;
+			let changes = self.display[r] & rotated_row;
+			self.registers[0xF] = (changes != 0).into();
+			self.display[r] ^= rotated_row;
+		}
+	}
+
+	pub fn load_program(&mut self, buf: Vec<u8>) {
+		for (i, e) in buf.iter().enumerate() {
+			self.buf[i + 0x200] = *e;
+		}
+	}
+
+	pub fn next_state(&mut self, event_pump: &mut EventPump) -> Result<(), String> {
+		if self.pc >= self.buf.len() {
+			return Err(String::from("Program counter exceeded memory allocations"));
+		}
+	
 		let instr: u16 = 
 			(self.buf[self.pc] as u16) << 8 | 
 			 self.buf[self.pc + 1] as u16;
@@ -89,7 +130,9 @@ impl Chip8 {
 					Some(addr) => {
 						self.pc = addr as usize;
 					},
-					None => return Err("attempted to exit from a subroutine when there was nothing to return to."),
+					None => return Err(String::from(
+						"attempted to exit from a subroutine when there was nothing to return to."
+					)),
 				}
 			},
 			_ => {},
@@ -133,13 +176,14 @@ impl Chip8 {
 			0xB000 => {
 				self.pc = self.registers[0] as usize + (instr & 0x0FFF) as usize;
 			},
-			// Set Vx = random byte AND kk.
+			// Cxkk: Set Vx = random byte AND kk.
 			0xC000 => {
 				let b: u8 = self.rand_thread.gen();
 				self.registers[x] = b & (instr as u8);
 			},
+			// Dxyn: Display n-byte sprite starting at memory location I at (Vx, Vy), set VF = collision.
 			0xD000 => {
-				panic!("Not implemented");
+				self.xor_sprite(x as u8, y as u8, instr as u8 & 0x000F);
 			},
 			_ => {},
 		}
@@ -212,11 +256,15 @@ impl Chip8 {
 		match instr & 0xF0FF {
 			// Ex93: Skip next instruction if key with the value of Vx is pressed.
 			0xE093 => {
-				panic!("Not implemented");
+				if is_hex_key_pressed(event_pump, self.registers[x]) {
+					self.pc += 2;
+				}
 			},
 			// ExA1: Skip next instruction if key with the value of Vx is not pressed.
 			0xE0A1 => {
-				panic!("Not implemented");
+				if !is_hex_key_pressed(event_pump, self.registers[x]) {
+					self.pc += 2;
+				}
 			},
 			// Fx07: Set Vx = delay timer value.
 			0xF007 => {
@@ -240,7 +288,7 @@ impl Chip8 {
 			},
 			// Fx29: Set I = location of sprite for digit Vx.
 			0xF029 => {
-				panic!("Not implemented");
+				self.addr_register = 5 * self.registers[x] as u16;
 			},
 			// Fx33: Store BCD representation of Vx in memory locations I, I+1, and I+2.
 			0xF033 => {
