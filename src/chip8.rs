@@ -1,54 +1,46 @@
 use rand::{thread_rng, Rng, prelude::ThreadRng};
-use sdl2::{EventPump, keyboard::Scancode};
+use sdl2::EventPump;
+use sdl2::keyboard::Scancode;
 
-//http://devernay.free.fr/hacks/chip8/C8TECH10.HTM
+use crate::keyboard;
 
+#[derive(Copy, Clone)]
 pub struct Config {
-	// 150->(300)->500 hz is recommended
-	clock_hz: u32, // the upperbound for how many instrs are done a second
-	screen_magnifier: u32, // x1, x2, x4, etc.
+	pub clock_hz: u32,
+	pub screen_magnifier: u32,	// How many screen pixels per console pixel
 }
 
-/*
-Keyboard layout:
-1 2 3 C
-4 5 6 D
-7 8 9 E
-A 0 B F
-some instrs can halt on keyboard input, or just get the state of the keyboard.
-*/
+impl Config {
+	pub fn new(clock_hz: u32, screen_magnifier: u32) -> Config {
+		Config { clock_hz, screen_magnifier }
+	}
+}
 
 pub struct Chip8 {
 	pc: usize,
-	buf: [u8; 4096],
+	
+	memory: [u8; 4096],
 	registers: [u8; 16],
 	addr_register: u16, // "I" register
-	addr_stack: Vec<u16>, // no additional alloc is done if you specify .with_capacity()
+	addr_stack: Vec<u16>, // 16 ptrs
+	
 	delay_timer: u8,
 	sound_timer: u8,
+
 	pub display: [u64; 32],
+	
 	rand_thread: ThreadRng,
-}
-/// Checks corresponding scancodes
-fn is_hex_key_pressed(event_pump: &mut EventPump, hex: u8) -> bool {
-	if hex > 0xF {
-		return false;
-	}
 
-	let codes = [
-		Scancode::Num1, Scancode::Num2, Scancode::Num3, Scancode::Num4, 
-		Scancode::Q,    Scancode::W,    Scancode::E,    Scancode::R,
-		Scancode::A,    Scancode::S,    Scancode::D,    Scancode::F,
-		Scancode::Z,    Scancode::X,    Scancode::C,    Scancode::V,
-	];
-
-	let code: Scancode = codes[hex as usize];
-	event_pump.keyboard_state().is_scancode_pressed(code)
+	pressed_scancodes: Vec<Scancode>,
 }
+
+//Sources:
+//http://devernay.free.fr/hacks/chip8/C8TECH10.HTM
+//https://en.wikipedia.org/wiki/CHIP-8
 
 impl Chip8 {
 	pub fn new() -> Chip8 {
-		let mut buf = [0; 4096];
+		let mut memory = [0; 4096];
 		let sprites = [
 			0xF0, 0x90, 0x90, 0x90, 0xF0, // 0x0
 			0x20, 0x60, 0x20, 0x20, 0x70,
@@ -69,12 +61,12 @@ impl Chip8 {
 		];
 		
 		for i in 0..sprites.len() {
-			buf[i] = sprites[i];
+			memory[i] = sprites[i];
 		}
 
 		Chip8 {
-			pc: 0,
-			buf,
+			pc: 0x200,
+			memory: memory,
 			registers: [0; 16],
 			addr_register: 0,
 			addr_stack: Vec::with_capacity(16),
@@ -82,6 +74,7 @@ impl Chip8 {
 			sound_timer: 0,
 			display: [0; 32],
 			rand_thread: thread_rng(),
+			pressed_scancodes: Vec::new(),
 		}
 	}
 
@@ -90,34 +83,42 @@ impl Chip8 {
 	/// it wraps around to the opposite side of the screen
 	fn xor_sprite(&mut self, x: u8, y: u8, n: u8) {
 		for i in 0..n {
-			let sprite_row = (self.buf[self.addr_register as usize + i as usize] as u64) << (64 - 8);
-			let rotated_row = sprite_row.rotate_right(x.into());
-			let r = ((y + i) % 32) as usize;
+			let sprite_row = (self.memory[self.addr_register as usize + i as usize] as u64) << (64 - 8);
+			let rotated_row = sprite_row.rotate_right(self.registers[x as usize].into());
+			let r = ((self.registers[y as usize] + i) % 32) as usize;
 			let changes = self.display[r] & rotated_row;
 			self.registers[0xF] = (changes != 0).into();
 			self.display[r] ^= rotated_row;
 		}
 	}
 
-	pub fn load_program(&mut self, buf: Vec<u8>) {
-		for (i, e) in buf.iter().enumerate() {
-			self.buf[i + 0x200] = *e;
+	#[inline]
+	pub fn register_key_press(&mut self, scancode: Scancode) {
+		self.pressed_scancodes.push(scancode);
+	}
+
+	pub fn load_program(&mut self, memory: Vec<u8>, start_address: usize) {
+		for (i, e) in memory.iter().enumerate() {
+			self.memory[i + start_address] = *e;
 		}
 	}
 
 	pub fn next_state(&mut self, event_pump: &mut EventPump) -> Result<(), String> {
-		if self.pc >= self.buf.len() {
-			return Err(String::from("Program counter exceeded memory allocations"));
+		if self.pc >= self.memory.len() {
+			return Err("program counter exceeded memory allocations".to_string());
 		}
-	
 		let instr: u16 = 
-			(self.buf[self.pc] as u16) << 8 | 
-			 self.buf[self.pc + 1] as u16;
-		
+			(self.memory[self.pc] as u16) << 8 | 
+			 self.memory[self.pc + 1] as u16;
+		//println!("pc={},instr={}",self.pc,instr);
 		self.pc += 2;
 	
 		let x = ((instr & 0x0F00) >> 8) as usize;
 		let y = ((instr & 0x00F0) >> 4) as usize;
+		let nnn = instr & 0xFFF;
+		let nn = (instr & 0xFF) as u8;
+
+		let mut missed_matches = 0;
 
 		match instr {
 			// Clears the screen.
@@ -130,62 +131,69 @@ impl Chip8 {
 					Some(addr) => {
 						self.pc = addr as usize;
 					},
-					None => return Err(String::from(
+					None => return Err(
 						"attempted to exit from a subroutine when there was nothing to return to."
-					)),
+						.to_string()
+					),
 				}
 			},
-			_ => {},
+			_ => missed_matches += 1,
 		}
 		
 		match instr & 0xF000 {
 			// 1nnn: Jumps to address NNN.
 			0x1000 => {
-				self.pc = (instr & 0x0FFF) as usize;
+				self.pc = nnn.into();
 			},
 			// 2nnn: Calls subroutine at NNN
 			0x2000 => {
+				if self.addr_stack.len() == 16 {
+					return Err(
+						"maximum level of subroutines reached"
+						.to_string()
+					);
+				}
 				self.addr_stack.push(self.pc as u16);
-				self.pc = (instr & 0x0FFF) as usize;
+				self.pc = nnn.into();
 			},
 			// 3xkk: Skips the next instruction if Vx equals kk.
 			0x3000 => {
-				if self.registers[x] == instr as u8 {
+				if self.registers[x] == nn {
 					self.pc += 2;
 				}
 			},
 			// 4xkk: Skip next instruction if Vx != kk.
 			0x4000 => {
-				if self.registers[x] != instr as u8 {
+				if self.registers[x] != nn {
 					self.pc += 2;
 				}
 			},
 			// 6xkk: The interpreter puts the value kk into register Vx.
 			0x6000 => {
-				self.registers[x] = instr as u8;
+				self.registers[x] = nn;
 			},
 			// 7xkk:  Adds the value kk to the value of register Vx, then stores the result in Vx.
 			0x7000 => {
-				self.registers[x] += instr as u8;
+				self.registers[x] = self.registers[x].wrapping_add(nn);
 			},
 			// Annn:  The value of register I is set to nnn.
 			0xA000 => {
-				self.addr_register = instr & 0x0FFF;
+				self.addr_register = nnn;
 			},
 			// Bnnn:  Jump to location nnn + V0.
 			0xB000 => {
-				self.pc = self.registers[0] as usize + (instr & 0x0FFF) as usize;
+				self.pc = self.registers[0] as usize + nnn as usize;
 			},
 			// Cxkk: Set Vx = random byte AND kk.
 			0xC000 => {
 				let b: u8 = self.rand_thread.gen();
-				self.registers[x] = b & (instr as u8);
+				self.registers[x] = b & nn;
 			},
 			// Dxyn: Display n-byte sprite starting at memory location I at (Vx, Vy), set VF = collision.
 			0xD000 => {
-				self.xor_sprite(x as u8, y as u8, instr as u8 & 0x000F);
+				self.xor_sprite(x as u8, y as u8, nn & 0xF);
 			},
-			_ => {},
+			_ => missed_matches += 1,
 		}
 
 		match instr & 0xF00F {
@@ -215,34 +223,29 @@ impl Chip8 {
 			0x8004 => {
 				let (sum, overflow) = self.registers[x].overflowing_add(self.registers[y]);
 				self.registers[x] = sum;
-				self.registers[0xF] = overflow as u8;
+				self.registers[0xF] = overflow.into();
 			},
 			// 8xy5: Set Vx = Vx - Vy, set VF = NOT borrow.
 			0x8005 => {
-				let (diff, underflow) = self.registers[x].overflowing_sub(self.registers[y]);
-				self.registers[x] = diff;
-				self.registers[0xF] = (!underflow) as u8;
+				self.registers[0xF] = (self.registers[x] >= self.registers[y]).into();
+				self.registers[x] = self.registers[x].wrapping_sub(self.registers[y]);
 			},
-			// 8xy6: Set Vx = Vy = Vy SHR 1.
+			// 8xy6: Set Vx = Vx SHR 1.
 			0x8006 => {
+				// TODO: CLEAR CONFUSION AROUND 800E and 8006
 				//https://www.reddit.com/r/EmuDev/comments/72dunw/chip8_8xy6_help/
-				self.registers[0xF] = self.registers[y] & 1;
-				self.registers[y] >>= 1;
-				self.registers[x] = self.registers[y];
+				self.registers[0xF] = self.registers[x] & 1;
+				self.registers[x] >>= 1;
 			},
 			// 8xy7: Set Vx = Vy - Vx, set VF = NOT borrow.
 			0x8007 => {
-				//COPIED^^^^
-				let (diff, underflow) = self.registers[y].overflowing_sub(self.registers[x]);
-				self.registers[x] = diff;
-				self.registers[0xF] = (!underflow) as u8;
+				self.registers[0xF] = (self.registers[y] >= self.registers[x]).into();
+				self.registers[x] = self.registers[y].wrapping_sub(self.registers[x]);
 			},
 			// 8xyE: Set Vx = Vx SHL 1.
 			0x800E => {
-				// TODO: CLEAR CONFUSION AROUND 800E and 8006
 				self.registers[0xF] = self.registers[x] >> 7;
-				self.registers[y] <<= 1;
-				self.registers[x] = self.registers[y];
+				self.registers[x] <<= 1;
 			},
 			// 9xy0: Skip next instruction if Vx != Vy.
 			0x9000 => {
@@ -250,19 +253,19 @@ impl Chip8 {
 					self.pc += 2;
 				}
 			},
-			_ => {},
+			_ => missed_matches += 1,
 		}
 
 		match instr & 0xF0FF {
 			// Ex93: Skip next instruction if key with the value of Vx is pressed.
 			0xE093 => {
-				if is_hex_key_pressed(event_pump, self.registers[x]) {
+				if keyboard::is_hex_key_pressed(event_pump, self.registers[x]) {
 					self.pc += 2;
 				}
 			},
 			// ExA1: Skip next instruction if key with the value of Vx is not pressed.
 			0xE0A1 => {
-				if !is_hex_key_pressed(event_pump, self.registers[x]) {
+				if !keyboard::is_hex_key_pressed(event_pump, self.registers[x]) {
 					self.pc += 2;
 				}
 			},
@@ -272,7 +275,12 @@ impl Chip8 {
 			},
 			// Fx0A: Wait for a key press, store the value of the key in Vx.
 			0xF00A => {
-				panic!("Not implemented");
+				if self.pressed_scancodes.len() == 0 {
+					self.pc -= 2; // Go back if nothing pressed
+				} else {
+					self.registers[x] = keyboard::scancode_to_value(self.pressed_scancodes[0]).unwrap();
+					self.pressed_scancodes.clear();
+				}
 			},
 			// Fx15: Set delay timer = Vx.
 			0xF015 => {
@@ -292,25 +300,41 @@ impl Chip8 {
 			},
 			// Fx33: Store BCD representation of Vx in memory locations I, I+1, and I+2.
 			0xF033 => {
-				self.buf[self.addr_register as usize] = self.registers[x] / 100;
-				self.buf[self.addr_register as usize + 1] = self.registers[x] / 10 % 10;
-				self.buf[self.addr_register as usize + 2] = self.registers[x] % 10;
+				self.memory[self.addr_register as usize] = self.registers[x] / 100;
+				self.memory[self.addr_register as usize + 1] = self.registers[x] / 10 % 10;
+				self.memory[self.addr_register as usize + 2] = self.registers[x] % 10;
 			},
 			// Fx55: Store registers V0 through Vx in memory starting at location I.
 			0xF055 => {
 				for i in 0..=x {
-					self.buf[self.addr_register as usize + i] = self.registers[i];
+					self.memory[self.addr_register as usize + i] = self.registers[i];
 				}
 			},
 			// Fx65: Read registers V0 through Vx from memory starting at location I.
 			0xF065 => {
 				for i in 0..=x {
-					self.registers[i] = self.buf[self.addr_register as usize + i];
+					self.registers[i] = self.memory[self.addr_register as usize + i];
 				}
 			},
-			_ => {},
+			_ => missed_matches += 1,
 		}
 
-		Ok(())
+		if missed_matches == 4 {
+			Err(format!("Unrecognized instruction {} at pc={}", instr, self.pc - 2))
+		} else {
+			Ok(())
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::Chip8;
+
+	#[test]
+	fn sprite_xor() {
+		let mut chip8 = Chip8::new();
+		chip8.xor_sprite(1, 1, 10);
+		println!("{:?}", chip8.display);
 	}
 }
